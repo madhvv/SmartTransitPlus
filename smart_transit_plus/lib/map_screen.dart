@@ -11,10 +11,12 @@ class MapScreen extends StatefulWidget {
 }
 
 class _MapScreenState extends State<MapScreen> {
+  final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   late GoogleMapController mapController;
 
   String? _selectedSource;
   String? _selectedDestination;
+  String? _selectedBusId; // currently selected bus id
 
   final Map<String, Marker> _markers = {};
   final Set<Polyline> _polylines = {};
@@ -24,6 +26,8 @@ class _MapScreenState extends State<MapScreen> {
   late BitmapDescriptor busRedIcon;
 
   StreamSubscription? _busSubscription;
+  PersistentBottomSheetController<dynamic>? _bottomSheetController;
+
   List<String> _allStops = [];
   Map<String, LatLng> _stopCoords = {}; // map stopName → coordinates
 
@@ -37,6 +41,7 @@ class _MapScreenState extends State<MapScreen> {
   @override
   void dispose() {
     _busSubscription?.cancel();
+    _bottomSheetController?.close();
     super.dispose();
   }
 
@@ -67,8 +72,6 @@ class _MapScreenState extends State<MapScreen> {
       _selectedSource = null;
       _selectedDestination = null;
     });
-
-    print("Stops loaded: $_allStops");
   }
 
   Future<void> _loadBusIcons() async {
@@ -97,10 +100,10 @@ class _MapScreenState extends State<MapScreen> {
 
           for (var doc in snapshot.docs) {
             final data = doc.data();
-            final coords = data["coordinates"];
-            final lat = coords["lat"] as double;
-            final lng = coords["lng"] as double;
-            final crowd = data["passengerCount"] ?? 0;
+            final coords = data["coordinates"] ?? {};
+            final lat = (coords["lat"] as num?)?.toDouble() ?? 0.0;
+            final lng = (coords["lng"] as num?)?.toDouble() ?? 0.0;
+            final crowd = (data["passengerCount"] as num?)?.toInt() ?? 0;
 
             BitmapDescriptor icon;
             if (crowd < 20) {
@@ -139,7 +142,6 @@ class _MapScreenState extends State<MapScreen> {
       return;
     }
 
-    // Figure out which route these stops belong to
     final snapshot = await FirebaseFirestore.instance
         .collection("routes")
         .get();
@@ -255,31 +257,133 @@ class _MapScreenState extends State<MapScreen> {
   void _showBusList(List<Marker> buses) {
     showModalBottomSheet(
       context: context,
+      isScrollControlled: true,
       builder: (context) {
-        return ListView.builder(
-          itemCount: buses.length,
-          itemBuilder: (context, index) {
-            final marker = buses[index];
-            return ListTile(
-              leading: const Icon(Icons.directions_bus, size: 32),
-              title: Text(marker.infoWindow.title ?? "Bus"),
-              subtitle: Text(marker.infoWindow.snippet ?? ""),
-              onTap: () {
-                Navigator.pop(context);
-                mapController.animateCamera(
-                  CameraUpdate.newLatLngZoom(marker.position, 16),
+        return SafeArea(
+          child: FractionallySizedBox(
+            heightFactor: 0.6,
+            child: ListView.builder(
+              itemCount: buses.length,
+              itemBuilder: (context, index) {
+                final marker = buses[index];
+                return ListTile(
+                  leading: const Icon(Icons.directions_bus, size: 32),
+                  title: Text(marker.infoWindow.title ?? "Bus"),
+                  subtitle: Text(marker.infoWindow.snippet ?? ""),
+                  onTap: () {
+                    final busId = marker.markerId.value;
+                    mapController.animateCamera(
+                      CameraUpdate.newLatLngZoom(marker.position, 16),
+                    );
+                    Navigator.pop(context);
+                    _openPersistentBusPanel(busId);
+                  },
                 );
               },
-            );
-          },
+            ),
+          ),
         );
       },
     );
   }
 
+  void _openPersistentBusPanel(String busId) {
+    _selectedBusId = busId;
+    _bottomSheetController?.close();
+
+    _bottomSheetController = _scaffoldKey.currentState?.showBottomSheet(
+      (context) {
+        return StreamBuilder<DocumentSnapshot>(
+          stream: FirebaseFirestore.instance
+              .collection("buses")
+              .doc(busId)
+              .snapshots(),
+          builder: (context, snapshot) {
+            if (!snapshot.hasData || !snapshot.data!.exists) {
+              return const SizedBox(
+                height: 150,
+                child: Center(child: CircularProgressIndicator()),
+              );
+            }
+
+            final data = snapshot.data!.data() as Map<String, dynamic>;
+            final coords = data["coordinates"] ?? {};
+            final lat = (coords["lat"] as num?)?.toDouble() ?? 0.0;
+            final lng = (coords["lng"] as num?)?.toDouble() ?? 0.0;
+            final passengerCount =
+                (data["passengerCount"] as num?)?.toInt() ?? 0;
+            final eta = (data["etaToNextStop"] as num?)?.toInt() ?? 0;
+            final nextStop = data["nextStop"] ?? "-";
+            final busNumber = data["busNumber"] ?? busId;
+
+            return Container(
+              height: 180,
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    busNumber,
+                    style: const TextStyle(
+                      fontSize: 18,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text("Passengers: $passengerCount"),
+                  Text("Next Stop: $nextStop"),
+                  Text("ETA: $eta min"),
+                  const Spacer(),
+                  Row(
+                    children: [
+                      ElevatedButton.icon(
+                        onPressed: () {
+                          mapController.animateCamera(
+                            CameraUpdate.newLatLngZoom(LatLng(lat, lng), 16),
+                          );
+                        },
+                        icon: const Icon(Icons.my_location),
+                        label: const Text("Center on bus"),
+                      ),
+                      const SizedBox(width: 12),
+                      ElevatedButton.icon(
+                        onPressed: () {
+                          _bottomSheetController?.close();
+                          _selectedBusId = null;
+                        },
+                        icon: const Icon(Icons.close),
+                        label: const Text("Close"),
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.grey.shade300,
+                          foregroundColor: Colors.black,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+      backgroundColor: Colors.white,
+      elevation: 8.0,
+    );
+
+    _bottomSheetController?.closed.then((_) {
+      if (mounted) {
+        setState(() {
+          _selectedBusId = null;
+          _bottomSheetController = null;
+        });
+      }
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      key: _scaffoldKey,
       body: Stack(
         children: [
           GoogleMap(
@@ -333,7 +437,6 @@ class _MapScreenState extends State<MapScreen> {
     required ValueChanged<String?> onChanged,
   }) {
     final bool disabled = _allStops.isEmpty;
-
     final String? safeValue = (value != null && _allStops.contains(value))
         ? value
         : null;
