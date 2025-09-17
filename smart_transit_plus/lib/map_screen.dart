@@ -1,7 +1,7 @@
 import 'dart:async';
-import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
@@ -13,34 +13,62 @@ class MapScreen extends StatefulWidget {
 class _MapScreenState extends State<MapScreen> {
   late GoogleMapController mapController;
 
-  // Controllers for search fields
-  final TextEditingController _sourceController = TextEditingController();
-  final TextEditingController _destinationController = TextEditingController();
-
-  final List<List<LatLng>> busRoutes = [
-    [
-      LatLng(8.5241, 76.9366), // Statue Junction
-      LatLng(8.5280, 76.9420), // Thampanoor
-      LatLng(8.5325, 76.9470), // PMG
-    ],
-    [LatLng(8.5260, 76.9350), LatLng(8.5290, 76.9380), LatLng(8.5315, 76.9410)],
-    [LatLng(8.5210, 76.9300), LatLng(8.5250, 76.9340), LatLng(8.5280, 76.9370)],
-  ];
+  String? _selectedSource;
+  String? _selectedDestination;
 
   final Map<String, Marker> _markers = {};
-  final Map<String, int> _busRouteIndex = {};
+  final Set<Polyline> _polylines = {};
 
   late BitmapDescriptor busGreenIcon;
   late BitmapDescriptor busYellowIcon;
   late BitmapDescriptor busRedIcon;
 
-  final Random _random = Random();
-  List<Map<String, dynamic>> _availableBuses = [];
+  StreamSubscription? _busSubscription;
+  List<String> _allStops = [];
+  Map<String, LatLng> _stopCoords = {}; // map stopName → coordinates
 
   @override
   void initState() {
     super.initState();
+    _loadStops();
     _loadBusIcons();
+  }
+
+  @override
+  void dispose() {
+    _busSubscription?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _loadStops() async {
+    final snapshot = await FirebaseFirestore.instance.collection("stops").get();
+
+    final Set<String> uniqueStops = {};
+    final Map<String, LatLng> coordsMap = {};
+
+    for (var doc in snapshot.docs) {
+      final data = doc.data();
+      final name = data['name'];
+      final coord = data['coordinates'];
+
+      if (name == null || coord == null) continue;
+
+      uniqueStops.add(name);
+
+      coordsMap[name] = LatLng(
+        (coord['lat'] as num).toDouble(),
+        (coord['lng'] as num).toDouble(),
+      );
+    }
+
+    setState(() {
+      _allStops = uniqueStops.toList()..sort();
+      _stopCoords = coordsMap;
+      _selectedSource = null;
+      _selectedDestination = null;
+    });
+
+    print("Stops loaded: $_allStops");
   }
 
   Future<void> _loadBusIcons() async {
@@ -57,104 +85,191 @@ class _MapScreenState extends State<MapScreen> {
       'assets/icons/bus_red.png',
     );
 
-    _initializeBuses();
-    _startBusMovement();
+    _listenToBuses();
   }
 
-  void _initializeBuses() {
-    for (int i = 0; i < busRoutes.length; i++) {
-      final route = busRoutes[i];
-      final markerId = 'bus_$i';
-      _busRouteIndex[markerId] = 0;
+  void _listenToBuses() {
+    _busSubscription = FirebaseFirestore.instance
+        .collection("buses")
+        .snapshots()
+        .listen((snapshot) {
+          final newMarkers = <String, Marker>{};
 
-      _markers[markerId] = Marker(
-        markerId: MarkerId(markerId),
-        position: route[0],
-        icon: busGreenIcon,
-      );
-    }
-    setState(() {});
+          for (var doc in snapshot.docs) {
+            final data = doc.data();
+            final coords = data["coordinates"];
+            final lat = coords["lat"] as double;
+            final lng = coords["lng"] as double;
+            final crowd = data["passengerCount"] ?? 0;
+
+            BitmapDescriptor icon;
+            if (crowd < 20) {
+              icon = busGreenIcon;
+            } else if (crowd < 40) {
+              icon = busYellowIcon;
+            } else {
+              icon = busRedIcon;
+            }
+
+            newMarkers[doc.id] = Marker(
+              markerId: MarkerId(doc.id),
+              position: LatLng(lat, lng),
+              icon: icon,
+              infoWindow: InfoWindow(
+                title: data["busNumber"] ?? doc.id,
+                snippet:
+                    "Passengers: $crowd\nNext stop: ${data["nextStop"]}\nETA: ${data["etaToNextStop"]} min",
+              ),
+            );
+          }
+
+          setState(() {
+            _markers
+              ..clear()
+              ..addAll(newMarkers);
+          });
+        });
   }
 
-  void _startBusMovement() {
-    Timer.periodic(const Duration(seconds: 2), (timer) {
-      final newMarkers = <String, Marker>{};
-      _markers.forEach((id, marker) {
-        final index = _busRouteIndex[id]!;
-        final route = busRoutes[int.parse(id.split('_')[1])];
-        final nextIndex = (index + 1) % route.length;
-
-        _busRouteIndex[id] = nextIndex;
-
-        // Decide icon color based on simulated crowding
-        int crowd = _random.nextInt(100); // random ppl
-        BitmapDescriptor icon;
-        if (crowd < 30) {
-          icon = busGreenIcon;
-        } else if (crowd < 50) {
-          icon = busYellowIcon;
-        } else {
-          icon = busRedIcon;
-        }
-
-        newMarkers[id] = marker.copyWith(
-          positionParam: route[nextIndex],
-          iconParam: icon,
-        );
-      });
-
-      setState(() {
-        _markers
-          ..clear()
-          ..addAll(newMarkers);
-      });
-    });
-  }
-
-  void _searchBuses() {
-    if (_sourceController.text.isEmpty || _destinationController.text.isEmpty) {
+  Future<void> _searchBuses() async {
+    if (_selectedSource == null || _selectedDestination == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Enter both source and destination")),
+        const SnackBar(content: Text("Select both source and destination")),
       );
       return;
     }
 
-    // Simulate available buses
-    final buses = List.generate(_markers.length, (i) {
-      int crowd = _random.nextInt(60);
-      int eta = 5 + _random.nextInt(15); // 5-20 minutes ETA
-      return {"busId": "Bus ${i + 1}", "crowd": crowd, "eta": eta};
-    });
+    // Figure out which route these stops belong to
+    final snapshot = await FirebaseFirestore.instance
+        .collection("routes")
+        .get();
 
-    setState(() {
-      _availableBuses = buses;
-    });
+    String? sourceRoute;
+    String? destRoute;
+    List<String> stops = [];
 
-    _showBusList();
+    for (var doc in snapshot.docs) {
+      final routeStops = List<String>.from(doc["stops"]);
+      if (routeStops.contains(_selectedSource)) {
+        sourceRoute = doc.id;
+      }
+      if (routeStops.contains(_selectedDestination)) {
+        destRoute = doc.id;
+      }
+      if (sourceRoute != null &&
+          destRoute != null &&
+          sourceRoute == destRoute) {
+        stops = routeStops;
+        break;
+      }
+    }
+
+    if (sourceRoute == null || destRoute == null || sourceRoute != destRoute) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("Source and destination must be on the same route"),
+        ),
+      );
+      return;
+    }
+
+    final srcIndex = stops.indexOf(_selectedSource!);
+    final destIndex = stops.indexOf(_selectedDestination!);
+
+    if (srcIndex == -1 || destIndex == -1 || srcIndex >= destIndex) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text("Invalid stop selection")));
+      return;
+    }
+
+    final busIds = List<String>.from(
+      (await FirebaseFirestore.instance
+                  .collection("routes")
+                  .doc(sourceRoute)
+                  .get())
+              .data()?["buses"] ??
+          [],
+    );
+
+    final buses = _markers.values
+        .where((m) => busIds.contains(m.markerId.value))
+        .toList();
+
+    if (buses.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("No buses available for this route")),
+      );
+      return;
+    }
+
+    final selectedRouteStops = stops.sublist(srcIndex, destIndex + 1);
+    _drawPolyline(selectedRouteStops);
+
+    _showBusList(buses);
   }
 
-  void _showBusList() {
+  void _drawPolyline(List<String> stopNames) {
+    if (stopNames.isEmpty) return;
+
+    final points = stopNames
+        .where((name) => _stopCoords.containsKey(name))
+        .map((name) => _stopCoords[name]!)
+        .toList();
+
+    setState(() {
+      _polylines.clear();
+      _polylines.add(
+        Polyline(
+          polylineId: const PolylineId("route"),
+          points: points,
+          color: Colors.blue,
+          width: 5,
+        ),
+      );
+    });
+
+    if (points.isNotEmpty) {
+      mapController.animateCamera(
+        CameraUpdate.newLatLngBounds(_boundsFromLatLngList(points), 60),
+      );
+    }
+  }
+
+  LatLngBounds _boundsFromLatLngList(List<LatLng> list) {
+    double x0 = list.first.latitude,
+        x1 = list.first.latitude,
+        y0 = list.first.longitude,
+        y1 = list.first.longitude;
+
+    for (LatLng latLng in list) {
+      if (latLng.latitude > x1) x1 = latLng.latitude;
+      if (latLng.latitude < x0) x0 = latLng.latitude;
+      if (latLng.longitude > y1) y1 = latLng.longitude;
+      if (latLng.longitude < y0) y0 = latLng.longitude;
+    }
+
+    return LatLngBounds(southwest: LatLng(x0, y0), northeast: LatLng(x1, y1));
+  }
+
+  void _showBusList(List<Marker> buses) {
     showModalBottomSheet(
       context: context,
       builder: (context) {
         return ListView.builder(
-          itemCount: _availableBuses.length,
+          itemCount: buses.length,
           itemBuilder: (context, index) {
-            final bus = _availableBuses[index];
-            Color color;
-            if (bus["crowd"] < 20) {
-              color = Colors.green;
-            } else if (bus["crowd"] < 40) {
-              color = Colors.orange;
-            } else {
-              color = Colors.red;
-            }
+            final marker = buses[index];
             return ListTile(
-              leading: Icon(Icons.directions_bus, color: color, size: 32),
-              title: Text(bus["busId"]),
-              subtitle: Text(
-                "Crowd: ${bus["crowd"]} people\nETA: ${bus["eta"]} mins",
-              ),
+              leading: const Icon(Icons.directions_bus, size: 32),
+              title: Text(marker.infoWindow.title ?? "Bus"),
+              subtitle: Text(marker.infoWindow.snippet ?? ""),
+              onTap: () {
+                Navigator.pop(context);
+                mapController.animateCamera(
+                  CameraUpdate.newLatLngZoom(marker.position, 16),
+                );
+              },
             );
           },
         );
@@ -170,9 +285,10 @@ class _MapScreenState extends State<MapScreen> {
           GoogleMap(
             initialCameraPosition: const CameraPosition(
               target: LatLng(8.5241, 76.9366),
-              zoom: 14,
+              zoom: 13,
             ),
             markers: _markers.values.toSet(),
+            polylines: _polylines,
             onMapCreated: (controller) {
               mapController = controller;
             },
@@ -183,9 +299,21 @@ class _MapScreenState extends State<MapScreen> {
             right: 15,
             child: Column(
               children: [
-                _buildTextField(_sourceController, "Enter Source"),
+                _buildDropdown(
+                  value: _selectedSource,
+                  hint: "Select Source",
+                  onChanged: (val) {
+                    setState(() => _selectedSource = val);
+                  },
+                ),
                 const SizedBox(height: 8),
-                _buildTextField(_destinationController, "Enter Destination"),
+                _buildDropdown(
+                  value: _selectedDestination,
+                  hint: "Select Destination",
+                  onChanged: (val) {
+                    setState(() => _selectedDestination = val);
+                  },
+                ),
                 const SizedBox(height: 8),
                 ElevatedButton(
                   onPressed: _searchBuses,
@@ -199,19 +327,34 @@ class _MapScreenState extends State<MapScreen> {
     );
   }
 
-  Widget _buildTextField(TextEditingController controller, String hint) {
+  Widget _buildDropdown({
+    required String? value,
+    required String hint,
+    required ValueChanged<String?> onChanged,
+  }) {
+    final bool disabled = _allStops.isEmpty;
+
+    final String? safeValue = (value != null && _allStops.contains(value))
+        ? value
+        : null;
+
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12),
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(8),
-        boxShadow: [
+        boxShadow: const [
           BoxShadow(color: Colors.black26, blurRadius: 4, offset: Offset(0, 2)),
         ],
       ),
-      child: TextField(
-        controller: controller,
+      child: DropdownButtonFormField<String>(
+        value: safeValue,
+        items: _allStops
+            .map((stop) => DropdownMenuItem(value: stop, child: Text(stop)))
+            .toList(),
+        onChanged: disabled ? null : onChanged,
         decoration: InputDecoration(border: InputBorder.none, hintText: hint),
+        hint: Text(disabled ? 'Loading stops...' : hint),
       ),
     );
   }

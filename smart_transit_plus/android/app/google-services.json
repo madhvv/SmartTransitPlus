@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "306279151103",
+    "project_id": "fir-1c3ad",
+    "storage_bucket": "fir-1c3ad.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:306279151103:android:c02c1d84c813047a12a3ca",
+        "android_client_info": {
+          "package_name": "com.example.smart_transit_plus"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCU6i2IuUtEnOyyPEEGk7GEPk0z78KSvGc"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
